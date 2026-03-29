@@ -75,7 +75,7 @@ export function useWebRTC({ role, roomCode, sendSignal, onDataChannel }: UseWebR
       const pc = createPeerConnection();
 
       // Receiver listens for incoming data channel
-      pc.ondatachannel = (e) => {
+      pc.ondatachannel = (e: RTCDataChannelEvent) => {
         dcRef.current = e.channel;
         onDataChannel(e.channel);
       };

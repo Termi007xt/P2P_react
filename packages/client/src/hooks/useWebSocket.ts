@@ -37,7 +37,7 @@ export function useWebSocket() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data) as ServerMessage;
-          handlersRef.current.forEach((h) => h(msg));
+          handlersRef.current.forEach((h: MessageHandler) => h(msg));
         } catch {
           // ignore non-JSON
         }

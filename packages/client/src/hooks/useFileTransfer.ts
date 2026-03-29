@@ -172,12 +172,12 @@ export function useFileTransfer() {
 
           if (msg.type === "file-complete") {
             // Assemble blob
-            const blob = new Blob(chunksRef.current, { type: "application/zip" });
+            const blob = new Blob(chunksRef.current as unknown as BlobPart[], { type: "application/zip" });
             const url = URL.createObjectURL(blob);
             setDownloadUrl(url);
 
             const totalTime = (performance.now() - startTimeRef.current) / 1000;
-            setStats((prev) => ({
+            setStats((prev: TransferStats) => ({
               ...prev,
               progress: 100,
               bytesTransferred: receivedBytesRef.current,
@@ -204,7 +204,7 @@ export function useFileTransfer() {
           lastBytesRef.current = receivedBytesRef.current;
 
           const totalBytes = stats.totalBytes || 1;
-          setStats((prev) => ({
+          setStats((prev: TransferStats) => ({
             ...prev,
             progress: Math.round((receivedBytesRef.current / prev.totalBytes) * 100),
             bytesTransferred: receivedBytesRef.current,

@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import React, { useRef } from "react";
 import type { RtcState, TransferStats } from "../types";
 import { StatusBadge } from "./StatusBadge";
 import { TransferProgress } from "./TransferProgress";
