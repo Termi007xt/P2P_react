@@ -1,6 +1,12 @@
 import { useCallback, useRef, useState } from "react";
 import type { FileMeta, TransferStats } from "../types";
-import { CHUNK_SIZE, BUFFERED_AMOUNT_LOW_THRESHOLD, SPEED_UPDATE_INTERVAL } from "../lib/constants";
+import {
+  CHUNK_SIZE,
+  DISK_READ_SIZE,
+  HIGH_WATER_MARK,
+  BUFFERED_AMOUNT_LOW_THRESHOLD,
+  SPEED_UPDATE_INTERVAL,
+} from "../lib/constants";
 
 const INITIAL_STATS: TransferStats = {
   progress: 0,
@@ -25,7 +31,7 @@ export function useFileTransfer() {
   const lastSpeedUpdateRef = useRef(0);
   const lastBytesRef = useRef(0);
 
-  // Abort handle for sender
+  // Abort handle
   const abortRef = useRef(false);
 
   const resetStats = useCallback(() => {
@@ -52,7 +58,7 @@ export function useFileTransfer() {
     const totalBytes = file.size;
     const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE);
 
-    // Send metadata as JSON string
+    // Send metadata
     const meta: FileMeta = {
       type: "file-meta",
       fileName: file.name,
@@ -78,10 +84,10 @@ export function useFileTransfer() {
 
     dc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
-    let offset = 0;
+    let fileOffset = 0;
 
-    /** Wait for the data channel buffer to drain */
-    const waitForBufferDrain = (): Promise<void> => {
+    /** Wait for the data channel buffer to drain below threshold */
+    const waitForDrain = (): Promise<void> => {
       return new Promise((resolve) => {
         if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) {
           resolve();
@@ -93,11 +99,6 @@ export function useFileTransfer() {
         };
         dc.addEventListener("bufferedamountlow", onLow);
       });
-    };
-
-    /** Read a file slice as ArrayBuffer (synchronous-like with await) */
-    const readSlice = (start: number, end: number): Promise<ArrayBuffer> => {
-      return file.slice(start, end).arrayBuffer();
     };
 
     const updateStats = (bytesSent: number) => {
@@ -119,27 +120,49 @@ export function useFileTransfer() {
       }
     };
 
-    /** Main send loop — truly sequential: read, wait for buffer, send */
+    /**
+     * High-throughput send loop:
+     * 1. Read a large block from disk (DISK_READ_SIZE, e.g. 16MB) — one async I/O
+     * 2. Split into CHUNK_SIZE pieces in memory (sync, fast)
+     * 3. Burst-send chunks to the data channel until HIGH_WATER_MARK
+     * 4. When buffer is full, wait for drain, then continue bursting
+     * 5. When the block is exhausted, read the next block from disk
+     */
     const sendLoop = async () => {
       try {
-        while (offset < totalBytes) {
+        while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
 
-          // Wait for buffer space before reading & sending
-          await waitForBufferDrain();
+          // 1. Read a large block from disk
+          const blockStart = fileOffset;
+          const blockEnd = Math.min(fileOffset + DISK_READ_SIZE, totalBytes);
+          const blockBuf = await file.slice(blockStart, blockEnd).arrayBuffer();
+          const blockLen = blockBuf.byteLength;
 
-          const end = Math.min(offset + CHUNK_SIZE, totalBytes);
-          const buf = await readSlice(offset, end);
+          // 2. Burst-send CHUNK_SIZE pieces from this block
+          let blockOffset = 0;
+          while (blockOffset < blockLen) {
+            if (abortRef.current || dc.readyState !== "open") return;
 
-          if (dc.readyState !== "open") return;
-          dc.send(buf);
+            // Wait for buffer space if needed
+            if (dc.bufferedAmount > HIGH_WATER_MARK) {
+              await waitForDrain();
+            }
 
-          offset = end;
-          updateStats(offset);
+            const chunkEnd = Math.min(blockOffset + CHUNK_SIZE, blockLen);
+            const chunk = blockBuf.slice(blockOffset, chunkEnd);
+            dc.send(chunk);
+
+            blockOffset = chunkEnd;
+            updateStats(blockStart + blockOffset);
+          }
+
+          // Advance file offset past this block
+          fileOffset = blockEnd;
         }
 
-        // All data sent — wait for final drain then send completion signal
-        await waitForBufferDrain();
+        // All data sent — wait for final drain
+        await waitForDrain();
 
         if (dc.readyState === "open") {
           dc.send(JSON.stringify({ type: "file-complete" }));
@@ -164,11 +187,9 @@ export function useFileTransfer() {
 
   // ── RECEIVER ──
 
-  /** Set up data channel handlers for receiving */
   const setupReceiver = useCallback((dc: RTCDataChannel) => {
     dc.binaryType = "arraybuffer";
 
-    // Track total expected bytes for this receiver instance
     let expectedBytes = 0;
 
     dc.onmessage = (e) => {
@@ -199,7 +220,6 @@ export function useFileTransfer() {
           }
 
           if (msg.type === "file-complete") {
-            // Assemble blob
             const blob = new Blob(chunksRef.current as unknown as BlobPart[], { type: "application/zip" });
             const url = URL.createObjectURL(blob);
             setDownloadUrl(url);

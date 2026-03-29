@@ -1,5 +1,7 @@
-export const CHUNK_SIZE = 64 * 1024; // 64 KB
-export const BUFFERED_AMOUNT_LOW_THRESHOLD = 512 * 1024; // 512 KB
+export const CHUNK_SIZE = 256 * 1024; // 256 KB — size of each WebRTC send
+export const DISK_READ_SIZE = 16 * 1024 * 1024; // 16 MB — read large blocks from disk at once
+export const HIGH_WATER_MARK = 16 * 1024 * 1024; // 16 MB — stop sending when buffer exceeds this
+export const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024; // 1 MB — resume sending when buffer drains to this
 export const SPEED_UPDATE_INTERVAL = 300; // ms
 
 export const RTC_CONFIG: RTCConfiguration = {
