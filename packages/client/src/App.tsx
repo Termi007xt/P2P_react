@@ -293,6 +293,8 @@ export default function App() {
             stats={transfer.stats}
             downloadUrl={transfer.downloadUrl}
             error={combinedError}
+            saveReady={transfer.saveReady}
+            onPromptSave={transfer.promptSaveLocation}
           />
         )}
 

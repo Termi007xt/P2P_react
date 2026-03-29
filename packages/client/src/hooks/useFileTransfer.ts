@@ -21,10 +21,13 @@ export function useFileTransfer() {
   const [incomingMeta, setIncomingMeta] = useState<FileMeta | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [saveReady, setSaveReady] = useState(false);
 
-  // Receiver state
+  // Receiver state — writable stream for disk-streaming, chunks for fallback
+  const writableRef = useRef<FileSystemWritableFileStream | null>(null);
   const chunksRef = useRef<Uint8Array[]>([]);
   const receivedBytesRef = useRef(0);
+  const useStreamRef = useRef(false);
 
   // Speed tracking
   const startTimeRef = useRef(0);
@@ -39,8 +42,11 @@ export function useFileTransfer() {
     setIncomingMeta(null);
     setDownloadUrl(null);
     setError(null);
+    setSaveReady(false);
+    writableRef.current = null;
     chunksRef.current = [];
     receivedBytesRef.current = 0;
+    useStreamRef.current = false;
     startTimeRef.current = 0;
     lastSpeedUpdateRef.current = 0;
     lastBytesRef.current = 0;
@@ -58,7 +64,6 @@ export function useFileTransfer() {
     const totalBytes = file.size;
     const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE);
 
-    // Send metadata
     const meta: FileMeta = {
       type: "file-meta",
       fileName: file.name,
@@ -86,7 +91,6 @@ export function useFileTransfer() {
 
     let fileOffset = 0;
 
-    /** Wait for the data channel buffer to drain below threshold */
     const waitForDrain = (): Promise<void> => {
       return new Promise((resolve) => {
         if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) {
@@ -101,7 +105,7 @@ export function useFileTransfer() {
       });
     };
 
-    const updateStats = (bytesSent: number) => {
+    const updateSendStats = (bytesSent: number) => {
       const now = performance.now();
       if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
         const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
@@ -120,32 +124,21 @@ export function useFileTransfer() {
       }
     };
 
-    /**
-     * High-throughput send loop:
-     * 1. Read a large block from disk (DISK_READ_SIZE, e.g. 16MB) — one async I/O
-     * 2. Split into CHUNK_SIZE pieces in memory (sync, fast)
-     * 3. Burst-send chunks to the data channel until HIGH_WATER_MARK
-     * 4. When buffer is full, wait for drain, then continue bursting
-     * 5. When the block is exhausted, read the next block from disk
-     */
     const sendLoop = async () => {
       try {
         while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
 
-          // 1. Read a large block from disk
           const blockStart = fileOffset;
           const blockEnd = Math.min(fileOffset + DISK_READ_SIZE, totalBytes);
           const blockBuf = await file.slice(blockStart, blockEnd).arrayBuffer();
           const blockLen = blockBuf.byteLength;
 
-          // 2. Burst-send CHUNK_SIZE pieces from this block
           let blockOffset = 0;
           while (blockOffset < blockLen) {
             if (abortRef.current || dc.readyState !== "open") return;
 
-            // Wait for buffer space if needed
-            if (dc.bufferedAmount > HIGH_WATER_MARK) {
+            while (dc.bufferedAmount >= HIGH_WATER_MARK) {
               await waitForDrain();
             }
 
@@ -154,14 +147,12 @@ export function useFileTransfer() {
             dc.send(chunk);
 
             blockOffset = chunkEnd;
-            updateStats(blockStart + blockOffset);
+            updateSendStats(blockStart + blockOffset);
           }
 
-          // Advance file offset past this block
           fileOffset = blockEnd;
         }
 
-        // All data sent — wait for final drain
         await waitForDrain();
 
         if (dc.readyState === "open") {
@@ -187,12 +178,53 @@ export function useFileTransfer() {
 
   // ── RECEIVER ──
 
+  /**
+   * Prompt the user to pick a save location using File System Access API.
+   * Called by ReceiverPanel when file-meta arrives.
+   * Returns true if streaming is set up, false if falling back to in-memory.
+   */
+  const promptSaveLocation = useCallback(async (meta: FileMeta): Promise<boolean> => {
+    // Check if File System Access API is available
+    if (!("showSaveFilePicker" in window)) {
+      // Fallback: use in-memory chunks
+      useStreamRef.current = false;
+      setSaveReady(true);
+      return false;
+    }
+
+    try {
+      const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> })
+        .showSaveFilePicker({
+          suggestedName: meta.fileName,
+          types: [
+            {
+              description: "ZIP Archive",
+              accept: { "application/zip": [".zip"] },
+            },
+          ],
+        });
+
+      const writable = await handle.createWritable();
+      writableRef.current = writable;
+      useStreamRef.current = true;
+      setSaveReady(true);
+      return true;
+    } catch (err) {
+      // User cancelled the picker — fall back to in-memory
+      console.warn("Save picker cancelled, using in-memory fallback:", err);
+      useStreamRef.current = false;
+      setSaveReady(true);
+      return false;
+    }
+  }, []);
+
+  /** Set up data channel handlers for receiving */
   const setupReceiver = useCallback((dc: RTCDataChannel) => {
     dc.binaryType = "arraybuffer";
 
     let expectedBytes = 0;
 
-    dc.onmessage = (e) => {
+    dc.onmessage = async (e) => {
       if (typeof e.data === "string") {
         try {
           const msg = JSON.parse(e.data);
@@ -215,27 +247,49 @@ export function useFileTransfer() {
               completed: false,
             });
             setDownloadUrl(null);
+            setSaveReady(false);
             setError(null);
             return;
           }
 
           if (msg.type === "file-complete") {
-            const blob = new Blob(chunksRef.current as unknown as BlobPart[], { type: "application/zip" });
-            const url = URL.createObjectURL(blob);
-            setDownloadUrl(url);
-
             const totalTime = (performance.now() - startTimeRef.current) / 1000;
             const finalBytes = receivedBytesRef.current;
-            setStats({
-              progress: 100,
-              bytesTransferred: finalBytes,
-              totalBytes: expectedBytes,
-              speed: totalTime > 0 ? finalBytes / totalTime : 0,
-              completed: true,
-            });
 
-            // Free chunk references (Blob now owns the data)
-            chunksRef.current = [];
+            if (useStreamRef.current && writableRef.current) {
+              // Streaming mode — close the writable stream, file is saved
+              try {
+                await writableRef.current.close();
+              } catch (err) {
+                console.error("Error closing writable stream:", err);
+              }
+              writableRef.current = null;
+
+              setStats({
+                progress: 100,
+                bytesTransferred: finalBytes,
+                totalBytes: expectedBytes,
+                speed: totalTime > 0 ? finalBytes / totalTime : 0,
+                completed: true,
+              });
+              // No downloadUrl needed — file is already saved to disk
+              setDownloadUrl("saved-to-disk");
+            } else {
+              // In-memory fallback — assemble blob
+              const blob = new Blob(chunksRef.current as unknown as BlobPart[], { type: "application/zip" });
+              const url = URL.createObjectURL(blob);
+              setDownloadUrl(url);
+
+              setStats({
+                progress: 100,
+                bytesTransferred: finalBytes,
+                totalBytes: expectedBytes,
+                speed: totalTime > 0 ? finalBytes / totalTime : 0,
+                completed: true,
+              });
+
+              chunksRef.current = [];
+            }
             return;
           }
         } catch {
@@ -243,10 +297,24 @@ export function useFileTransfer() {
         }
       } else {
         // Binary chunk
-        const chunk = new Uint8Array(e.data as ArrayBuffer);
-        chunksRef.current.push(chunk);
-        receivedBytesRef.current += chunk.byteLength;
+        const data = e.data as ArrayBuffer;
+        receivedBytesRef.current += data.byteLength;
 
+        if (useStreamRef.current && writableRef.current) {
+          // Stream directly to disk — no memory buildup
+          try {
+            await writableRef.current.write(new Uint8Array(data));
+          } catch (err) {
+            console.error("Disk write error:", err);
+            setError(`Disk write failed: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+          }
+        } else {
+          // In-memory fallback
+          chunksRef.current.push(new Uint8Array(data));
+        }
+
+        // Update stats periodically
         const now = performance.now();
         if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
           const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
@@ -271,9 +339,11 @@ export function useFileTransfer() {
     incomingMeta,
     downloadUrl,
     error,
+    saveReady,
     setError,
     sendFile,
     setupReceiver,
+    promptSaveLocation,
     resetStats,
   };
 }
