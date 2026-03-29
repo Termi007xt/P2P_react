@@ -180,14 +180,22 @@ export function useFileTransfer() {
         const boostPromise = addBatch(BOOST_BATCH);
 
         let fileOffset = 0;
-        let chIdx = 0;
         let lastScaleCheck = performance.now();
+        let lastChannelLog = 0;
 
-        // Wait briefly for first boost channels to connect
-        await Promise.race([boostPromise, new Promise(r => setTimeout(r, 2000))]);
+        // Wait for first boost channels to connect
+        await Promise.race([boostPromise, new Promise(r => setTimeout(r, 4000))]);
+        console.log(`[P2P] Starting transfer with ${channels.length} channels`);
 
         while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
+
+          // Log active channel count periodically
+          const openCount = channels.filter(c => c.readyState === "open").length;
+          if (openCount !== lastChannelLog) {
+            console.log(`[P2P] Active channels: ${openCount}`);
+            lastChannelLog = openCount;
+          }
 
           // Adaptive scaling check
           const now = performance.now();
@@ -195,8 +203,9 @@ export function useFileTransfer() {
             lastScaleCheck = now;
             const elapsed = (now - startTimeRef.current) / 1000;
             const currentSpeed = elapsed > 0 ? fileOffset / elapsed : 0;
+            console.log(`[P2P] Speed: ${(currentSpeed / 1024 / 1024).toFixed(1)} MB/s, channels: ${openCount}`);
             if (currentSpeed < SPEED_TARGET && channels.length < MAX_CHANNELS) {
-              addBatch(BOOST_BATCH); // fire-and-forget, channels join pool when ready
+              addBatch(BOOST_BATCH);
             } else if (channels.length >= MAX_CHANNELS || currentSpeed >= SPEED_TARGET) {
               scalingDone = true;
             }
@@ -211,15 +220,30 @@ export function useFileTransfer() {
           let bOff = 0;
           while (bOff < blockLen) {
             if (abortRef.current) return;
-            // Pick channel (round-robin)
-            const ch = channels[chIdx % channels.length];
-            if (ch.readyState !== "open") { chIdx++; continue; }
-            while (ch.bufferedAmount >= HIGH_WATER_MARK) { await waitDrain(ch); }
+
+            // Pick the channel with the LOWEST bufferedAmount (least-loaded)
+            let best: RTCDataChannel | null = null;
+            let bestBuf = Infinity;
+            for (const ch of channels) {
+              if (ch.readyState === "open" && ch.bufferedAmount < bestBuf) {
+                best = ch; bestBuf = ch.bufferedAmount;
+              }
+            }
+
+            if (!best) { await new Promise(r => setTimeout(r, 50)); continue; }
+
+            // If even the least-loaded channel is full, wait for ANY to drain
+            if (bestBuf >= HIGH_WATER_MARK) {
+              await Promise.race(
+                channels.filter(c => c.readyState === "open").map(waitDrain)
+              );
+              continue; // re-pick after drain
+            }
 
             const end = Math.min(bOff + DATA_PER_CHUNK, blockLen);
             const packed = packChunk(blockStart + bOff, blockBuf.slice(bOff, end));
-            ch.send(packed);
-            bOff = end; chIdx++;
+            best.send(packed);
+            bOff = end;
             updateStats(blockStart + bOff);
           }
           fileOffset = blockEnd;
