@@ -25,6 +25,9 @@ export function useFileTransfer() {
   const lastSpeedUpdateRef = useRef(0);
   const lastBytesRef = useRef(0);
 
+  // Abort handle for sender
+  const abortRef = useRef(false);
+
   const resetStats = useCallback(() => {
     setStats(INITIAL_STATS);
     setIncomingMeta(null);
@@ -35,6 +38,7 @@ export function useFileTransfer() {
     startTimeRef.current = 0;
     lastSpeedUpdateRef.current = 0;
     lastBytesRef.current = 0;
+    abortRef.current = false;
   }, []);
 
   // ── SENDER ──
@@ -67,75 +71,95 @@ export function useFileTransfer() {
       completed: false,
     });
 
+    abortRef.current = false;
     startTimeRef.current = performance.now();
     lastSpeedUpdateRef.current = performance.now();
     lastBytesRef.current = 0;
 
-    let offset = 0;
-
     dc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
-    const sendNextChunks = () => {
-      while (offset < totalBytes) {
-        if (dc.bufferedAmount > BUFFERED_AMOUNT_LOW_THRESHOLD) {
-          // Wait for buffer to drain
+    let offset = 0;
+
+    /** Wait for the data channel buffer to drain */
+    const waitForBufferDrain = (): Promise<void> => {
+      return new Promise((resolve) => {
+        if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) {
+          resolve();
           return;
         }
+        const onLow = () => {
+          dc.removeEventListener("bufferedamountlow", onLow);
+          resolve();
+        };
+        dc.addEventListener("bufferedamountlow", onLow);
+      });
+    };
 
-        const end = Math.min(offset + CHUNK_SIZE, totalBytes);
-        const slice = file.slice(offset, end);
+    /** Read a file slice as ArrayBuffer (synchronous-like with await) */
+    const readSlice = (start: number, end: number): Promise<ArrayBuffer> => {
+      return file.slice(start, end).arrayBuffer();
+    };
 
-        slice.arrayBuffer().then((buf) => {
+    const updateStats = (bytesSent: number) => {
+      const now = performance.now();
+      if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
+        const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
+        const bytesDelta = bytesSent - lastBytesRef.current;
+        const speed = elapsed > 0 ? bytesDelta / elapsed : 0;
+        lastSpeedUpdateRef.current = now;
+        lastBytesRef.current = bytesSent;
+
+        setStats({
+          progress: Math.round((bytesSent / totalBytes) * 100),
+          bytesTransferred: bytesSent,
+          totalBytes,
+          speed,
+          completed: false,
+        });
+      }
+    };
+
+    /** Main send loop — truly sequential: read, wait for buffer, send */
+    const sendLoop = async () => {
+      try {
+        while (offset < totalBytes) {
+          if (abortRef.current || dc.readyState !== "open") return;
+
+          // Wait for buffer space before reading & sending
+          await waitForBufferDrain();
+
+          const end = Math.min(offset + CHUNK_SIZE, totalBytes);
+          const buf = await readSlice(offset, end);
+
           if (dc.readyState !== "open") return;
           dc.send(buf);
-        });
 
-        offset = end;
-
-        // Update stats periodically
-        const now = performance.now();
-        if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
-          const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
-          const bytesDelta = offset - lastBytesRef.current;
-          const speed = elapsed > 0 ? bytesDelta / elapsed : 0;
-          lastSpeedUpdateRef.current = now;
-          lastBytesRef.current = offset;
-
-          setStats({
-            progress: Math.round((offset / totalBytes) * 100),
-            bytesTransferred: offset,
-            totalBytes,
-            speed,
-            completed: false,
-          });
+          offset = end;
+          updateStats(offset);
         }
-      }
 
-      // All chunks queued
-      // We need to wait until bufferedAmount drains to 0 before sending file-complete
-      const waitForDrain = () => {
-        if (dc.bufferedAmount === 0) {
+        // All data sent — wait for final drain then send completion signal
+        await waitForBufferDrain();
+
+        if (dc.readyState === "open") {
           dc.send(JSON.stringify({ type: "file-complete" }));
-          const totalTime = (performance.now() - startTimeRef.current) / 1000;
-          setStats({
-            progress: 100,
-            bytesTransferred: totalBytes,
-            totalBytes,
-            speed: totalTime > 0 ? totalBytes / totalTime : 0,
-            completed: true,
-          });
-        } else {
-          setTimeout(waitForDrain, 50);
         }
-      };
-      waitForDrain();
+
+        const totalTime = (performance.now() - startTimeRef.current) / 1000;
+        setStats({
+          progress: 100,
+          bytesTransferred: totalBytes,
+          totalBytes,
+          speed: totalTime > 0 ? totalBytes / totalTime : 0,
+          completed: true,
+        });
+      } catch (err) {
+        console.error("Send error:", err);
+        setError(`Transfer failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     };
 
-    dc.onbufferedamountlow = () => {
-      sendNextChunks();
-    };
-
-    sendNextChunks();
+    sendLoop();
   }, []);
 
   // ── RECEIVER ──
@@ -143,6 +167,9 @@ export function useFileTransfer() {
   /** Set up data channel handlers for receiving */
   const setupReceiver = useCallback((dc: RTCDataChannel) => {
     dc.binaryType = "arraybuffer";
+
+    // Track total expected bytes for this receiver instance
+    let expectedBytes = 0;
 
     dc.onmessage = (e) => {
       if (typeof e.data === "string") {
@@ -152,6 +179,7 @@ export function useFileTransfer() {
           if (msg.type === "file-meta") {
             const meta = msg as FileMeta;
             setIncomingMeta(meta);
+            expectedBytes = meta.fileSize;
             chunksRef.current = [];
             receivedBytesRef.current = 0;
             startTimeRef.current = performance.now();
@@ -177,13 +205,17 @@ export function useFileTransfer() {
             setDownloadUrl(url);
 
             const totalTime = (performance.now() - startTimeRef.current) / 1000;
-            setStats((prev: TransferStats) => ({
-              ...prev,
+            const finalBytes = receivedBytesRef.current;
+            setStats({
               progress: 100,
-              bytesTransferred: receivedBytesRef.current,
-              speed: totalTime > 0 ? receivedBytesRef.current / totalTime : 0,
+              bytesTransferred: finalBytes,
+              totalBytes: expectedBytes,
+              speed: totalTime > 0 ? finalBytes / totalTime : 0,
               completed: true,
-            }));
+            });
+
+            // Free chunk references (Blob now owns the data)
+            chunksRef.current = [];
             return;
           }
         } catch {
@@ -203,17 +235,16 @@ export function useFileTransfer() {
           lastSpeedUpdateRef.current = now;
           lastBytesRef.current = receivedBytesRef.current;
 
-          const totalBytes = stats.totalBytes || 1;
           setStats((prev: TransferStats) => ({
             ...prev,
-            progress: Math.round((receivedBytesRef.current / prev.totalBytes) * 100),
+            progress: Math.round((receivedBytesRef.current / (expectedBytes || 1)) * 100),
             bytesTransferred: receivedBytesRef.current,
             speed,
           }));
         }
       }
     };
-  }, [stats.totalBytes]);
+  }, []);
 
   return {
     stats,
