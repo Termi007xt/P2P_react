@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/types.ts","./src/components/homescreen.tsx","./src/components/receiverpanel.tsx","./src/components/senderpanel.tsx","./src/components/statusbadge.tsx","./src/components/transferprogress.tsx","./src/hooks/usefiletransfer.ts","./src/hooks/usewebrtc.ts","./src/hooks/usewebsocket.ts","./src/lib/constants.ts"],"version":"5.8.3"}
