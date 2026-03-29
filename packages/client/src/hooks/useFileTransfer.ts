@@ -9,11 +9,7 @@ import {
 } from "../lib/constants";
 
 const INITIAL_STATS: TransferStats = {
-  progress: 0,
-  bytesTransferred: 0,
-  totalBytes: 0,
-  speed: 0,
-  completed: false,
+  progress: 0, bytesTransferred: 0, totalBytes: 0, speed: 0, completed: false,
 };
 
 export function useFileTransfer() {
@@ -23,18 +19,20 @@ export function useFileTransfer() {
   const [error, setError] = useState<string | null>(null);
   const [saveReady, setSaveReady] = useState(false);
 
-  // Receiver state — writable stream for disk-streaming, chunks for fallback
+  // Receiver: data channel ref (for sending control messages back)
+  const dcRef = useRef<RTCDataChannel | null>(null);
+
+  // Receiver: disk streaming
   const writableRef = useRef<FileSystemWritableFileStream | null>(null);
-  const chunksRef = useRef<Uint8Array[]>([]);
+  const chunksRef = useRef<Uint8Array[]>([]); // in-memory fallback
   const receivedBytesRef = useRef(0);
   const useStreamRef = useRef(false);
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
 
   // Speed tracking
   const startTimeRef = useRef(0);
   const lastSpeedUpdateRef = useRef(0);
   const lastBytesRef = useRef(0);
-
-  // Abort handle
   const abortRef = useRef(false);
 
   const resetStats = useCallback(() => {
@@ -43,89 +41,78 @@ export function useFileTransfer() {
     setDownloadUrl(null);
     setError(null);
     setSaveReady(false);
+    dcRef.current = null;
     writableRef.current = null;
     chunksRef.current = [];
     receivedBytesRef.current = 0;
     useStreamRef.current = false;
+    writeChainRef.current = Promise.resolve();
     startTimeRef.current = 0;
     lastSpeedUpdateRef.current = 0;
     lastBytesRef.current = 0;
     abortRef.current = false;
   }, []);
 
-  // ── SENDER ──
+  // ────────────────── SENDER ──────────────────
 
   const sendFile = useCallback((file: File, dc: RTCDataChannel) => {
-    if (!file.name.endsWith(".zip")) {
-      setError("Only .zip files are allowed.");
-      return;
-    }
+    if (!file.name.endsWith(".zip")) { setError("Only .zip files are allowed."); return; }
 
     const totalBytes = file.size;
-    const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE);
-
     const meta: FileMeta = {
-      type: "file-meta",
-      fileName: file.name,
-      fileSize: totalBytes,
-      mimeType: "application/zip",
-      chunkSize: CHUNK_SIZE,
-      totalChunks,
+      type: "file-meta", fileName: file.name, fileSize: totalBytes,
+      mimeType: "application/zip", chunkSize: CHUNK_SIZE,
+      totalChunks: Math.ceil(totalBytes / CHUNK_SIZE),
     };
     dc.send(JSON.stringify(meta));
 
-    setStats({
-      progress: 0,
-      bytesTransferred: 0,
-      totalBytes,
-      speed: 0,
-      completed: false,
-    });
+    setStats({ progress: 0, bytesTransferred: 0, totalBytes, speed: 0, completed: false });
 
     abortRef.current = false;
     startTimeRef.current = performance.now();
     lastSpeedUpdateRef.current = performance.now();
     lastBytesRef.current = 0;
-
     dc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
     let fileOffset = 0;
 
-    const waitForDrain = (): Promise<void> => {
-      return new Promise((resolve) => {
-        if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) {
-          resolve();
-          return;
+    // ── Wait for receiver to signal ready ──
+    const waitForReady = new Promise<void>((resolve) => {
+      const listener = (ev: MessageEvent) => {
+        if (typeof ev.data === "string") {
+          try {
+            if (JSON.parse(ev.data).type === "ready-to-receive") {
+              dc.removeEventListener("message", listener);
+              resolve();
+            }
+          } catch { /* ignore */ }
         }
-        const onLow = () => {
-          dc.removeEventListener("bufferedamountlow", onLow);
-          resolve();
-        };
-        dc.addEventListener("bufferedamountlow", onLow);
-      });
-    };
+      };
+      dc.addEventListener("message", listener);
+    });
+
+    const waitForDrain = (): Promise<void> => new Promise((resolve) => {
+      if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) { resolve(); return; }
+      const onLow = () => { dc.removeEventListener("bufferedamountlow", onLow); resolve(); };
+      dc.addEventListener("bufferedamountlow", onLow);
+    });
 
     const updateSendStats = (bytesSent: number) => {
       const now = performance.now();
       if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
         const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
-        const bytesDelta = bytesSent - lastBytesRef.current;
-        const speed = elapsed > 0 ? bytesDelta / elapsed : 0;
+        const speed = elapsed > 0 ? (bytesSent - lastBytesRef.current) / elapsed : 0;
         lastSpeedUpdateRef.current = now;
         lastBytesRef.current = bytesSent;
-
-        setStats({
-          progress: Math.round((bytesSent / totalBytes) * 100),
-          bytesTransferred: bytesSent,
-          totalBytes,
-          speed,
-          completed: false,
-        });
+        setStats({ progress: Math.round((bytesSent / totalBytes) * 100),
+          bytesTransferred: bytesSent, totalBytes, speed, completed: false });
       }
     };
 
     const sendLoop = async () => {
       try {
+        await waitForReady; // ← sender blocks until receiver picks save location
+
         while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
 
@@ -134,39 +121,25 @@ export function useFileTransfer() {
           const blockBuf = await file.slice(blockStart, blockEnd).arrayBuffer();
           const blockLen = blockBuf.byteLength;
 
-          let blockOffset = 0;
-          while (blockOffset < blockLen) {
+          let bOff = 0;
+          while (bOff < blockLen) {
             if (abortRef.current || dc.readyState !== "open") return;
+            while (dc.bufferedAmount >= HIGH_WATER_MARK) { await waitForDrain(); }
 
-            while (dc.bufferedAmount >= HIGH_WATER_MARK) {
-              await waitForDrain();
-            }
-
-            const chunkEnd = Math.min(blockOffset + CHUNK_SIZE, blockLen);
-            const chunk = blockBuf.slice(blockOffset, chunkEnd);
-            dc.send(chunk);
-
-            blockOffset = chunkEnd;
-            updateSendStats(blockStart + blockOffset);
+            const end = Math.min(bOff + CHUNK_SIZE, blockLen);
+            dc.send(blockBuf.slice(bOff, end));
+            bOff = end;
+            updateSendStats(blockStart + bOff);
           }
-
           fileOffset = blockEnd;
         }
 
         await waitForDrain();
-
-        if (dc.readyState === "open") {
-          dc.send(JSON.stringify({ type: "file-complete" }));
-        }
+        if (dc.readyState === "open") dc.send(JSON.stringify({ type: "file-complete" }));
 
         const totalTime = (performance.now() - startTimeRef.current) / 1000;
-        setStats({
-          progress: 100,
-          bytesTransferred: totalBytes,
-          totalBytes,
-          speed: totalTime > 0 ? totalBytes / totalTime : 0,
-          completed: true,
-        });
+        setStats({ progress: 100, bytesTransferred: totalBytes, totalBytes,
+          speed: totalTime > 0 ? totalBytes / totalTime : 0, completed: true });
       } catch (err) {
         console.error("Send error:", err);
         setError(`Transfer failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -176,55 +149,48 @@ export function useFileTransfer() {
     sendLoop();
   }, []);
 
-  // ── RECEIVER ──
+  // ────────────────── RECEIVER ──────────────────
 
-  /**
-   * Prompt the user to pick a save location using File System Access API.
-   * Called by ReceiverPanel when file-meta arrives.
-   * Returns true if streaming is set up, false if falling back to in-memory.
-   */
+  /** Prompt user to pick save location, then signal sender to start */
   const promptSaveLocation = useCallback(async (meta: FileMeta): Promise<boolean> => {
-    // Check if File System Access API is available
-    if (!("showSaveFilePicker" in window)) {
-      // Fallback: use in-memory chunks
-      useStreamRef.current = false;
-      setSaveReady(true);
-      return false;
-    }
+    let streaming = false;
 
-    try {
-      const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> })
-        .showSaveFilePicker({
+    if ("showSaveFilePicker" in window) {
+      try {
+        const handle = await (window as unknown as {
+          showSaveFilePicker: (o: unknown) => Promise<FileSystemFileHandle>;
+        }).showSaveFilePicker({
           suggestedName: meta.fileName,
-          types: [
-            {
-              description: "ZIP Archive",
-              accept: { "application/zip": [".zip"] },
-            },
-          ],
+          types: [{ description: "ZIP Archive", accept: { "application/zip": [".zip"] } }],
         });
-
-      const writable = await handle.createWritable();
-      writableRef.current = writable;
-      useStreamRef.current = true;
-      setSaveReady(true);
-      return true;
-    } catch (err) {
-      // User cancelled the picker — fall back to in-memory
-      console.warn("Save picker cancelled, using in-memory fallback:", err);
-      useStreamRef.current = false;
-      setSaveReady(true);
-      return false;
+        const writable = await handle.createWritable();
+        writableRef.current = writable;
+        useStreamRef.current = true;
+        streaming = true;
+      } catch {
+        // User cancelled — fall back to in-memory
+        useStreamRef.current = false;
+      }
     }
+
+    setSaveReady(true);
+
+    // Signal sender: "I'm ready, start sending chunks"
+    if (dcRef.current?.readyState === "open") {
+      dcRef.current.send(JSON.stringify({ type: "ready-to-receive" }));
+    }
+
+    return streaming;
   }, []);
 
   /** Set up data channel handlers for receiving */
   const setupReceiver = useCallback((dc: RTCDataChannel) => {
     dc.binaryType = "arraybuffer";
+    dcRef.current = dc;
 
     let expectedBytes = 0;
 
-    dc.onmessage = async (e) => {
+    dc.onmessage = (e) => {
       if (typeof e.data === "string") {
         try {
           const msg = JSON.parse(e.data);
@@ -235,17 +201,12 @@ export function useFileTransfer() {
             expectedBytes = meta.fileSize;
             chunksRef.current = [];
             receivedBytesRef.current = 0;
+            writeChainRef.current = Promise.resolve();
             startTimeRef.current = performance.now();
             lastSpeedUpdateRef.current = performance.now();
             lastBytesRef.current = 0;
-
-            setStats({
-              progress: 0,
-              bytesTransferred: 0,
-              totalBytes: meta.fileSize,
-              speed: 0,
-              completed: false,
-            });
+            setStats({ progress: 0, bytesTransferred: 0, totalBytes: meta.fileSize,
+              speed: 0, completed: false });
             setDownloadUrl(null);
             setSaveReady(false);
             setError(null);
@@ -253,64 +214,41 @@ export function useFileTransfer() {
           }
 
           if (msg.type === "file-complete") {
-            const totalTime = (performance.now() - startTimeRef.current) / 1000;
-            const finalBytes = receivedBytesRef.current;
+            // Wait for all queued writes to finish, then finalize
+            writeChainRef.current.then(async () => {
+              const totalTime = (performance.now() - startTimeRef.current) / 1000;
+              const finalBytes = receivedBytesRef.current;
 
-            if (useStreamRef.current && writableRef.current) {
-              // Streaming mode — close the writable stream, file is saved
-              try {
-                await writableRef.current.close();
-              } catch (err) {
-                console.error("Error closing writable stream:", err);
+              if (useStreamRef.current && writableRef.current) {
+                try { await writableRef.current.close(); } catch (err) {
+                  console.error("Error closing stream:", err);
+                }
+                writableRef.current = null;
+                setDownloadUrl("saved-to-disk");
+              } else {
+                const blob = new Blob(chunksRef.current as unknown as BlobPart[],
+                  { type: "application/zip" });
+                setDownloadUrl(URL.createObjectURL(blob));
+                chunksRef.current = [];
               }
-              writableRef.current = null;
 
-              setStats({
-                progress: 100,
-                bytesTransferred: finalBytes,
+              setStats({ progress: 100, bytesTransferred: finalBytes,
                 totalBytes: expectedBytes,
-                speed: totalTime > 0 ? finalBytes / totalTime : 0,
-                completed: true,
-              });
-              // No downloadUrl needed — file is already saved to disk
-              setDownloadUrl("saved-to-disk");
-            } else {
-              // In-memory fallback — assemble blob
-              const blob = new Blob(chunksRef.current as unknown as BlobPart[], { type: "application/zip" });
-              const url = URL.createObjectURL(blob);
-              setDownloadUrl(url);
-
-              setStats({
-                progress: 100,
-                bytesTransferred: finalBytes,
-                totalBytes: expectedBytes,
-                speed: totalTime > 0 ? finalBytes / totalTime : 0,
-                completed: true,
-              });
-
-              chunksRef.current = [];
-            }
+                speed: totalTime > 0 ? finalBytes / totalTime : 0, completed: true });
+            });
             return;
           }
-        } catch {
-          // Not JSON, ignore
-        }
+        } catch { /* ignore */ }
       } else {
-        // Binary chunk
+        // Binary chunk — write to disk (queued) or memory
         const data = e.data as ArrayBuffer;
         receivedBytesRef.current += data.byteLength;
 
         if (useStreamRef.current && writableRef.current) {
-          // Stream directly to disk — no memory buildup
-          try {
-            await writableRef.current.write(new Uint8Array(data));
-          } catch (err) {
-            console.error("Disk write error:", err);
-            setError(`Disk write failed: ${err instanceof Error ? err.message : String(err)}`);
-            return;
-          }
+          // Chain writes sequentially so they don't pile up as parallel promises
+          const w = writableRef.current;
+          writeChainRef.current = writeChainRef.current.then(() => w.write(data));
         } else {
-          // In-memory fallback
           chunksRef.current.push(new Uint8Array(data));
         }
 
@@ -318,32 +256,20 @@ export function useFileTransfer() {
         const now = performance.now();
         if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
           const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
-          const bytesDelta = receivedBytesRef.current - lastBytesRef.current;
-          const speed = elapsed > 0 ? bytesDelta / elapsed : 0;
+          const speed = elapsed > 0
+            ? (receivedBytesRef.current - lastBytesRef.current) / elapsed : 0;
           lastSpeedUpdateRef.current = now;
           lastBytesRef.current = receivedBytesRef.current;
-
-          setStats((prev: TransferStats) => ({
-            ...prev,
+          setStats((prev: TransferStats) => ({ ...prev,
             progress: Math.round((receivedBytesRef.current / (expectedBytes || 1)) * 100),
-            bytesTransferred: receivedBytesRef.current,
-            speed,
-          }));
+            bytesTransferred: receivedBytesRef.current, speed }));
         }
       }
     };
   }, []);
 
   return {
-    stats,
-    incomingMeta,
-    downloadUrl,
-    error,
-    saveReady,
-    setError,
-    sendFile,
-    setupReceiver,
-    promptSaveLocation,
-    resetStats,
+    stats, incomingMeta, downloadUrl, error, saveReady, setError,
+    sendFile, setupReceiver, promptSaveLocation, resetStats,
   };
 }
