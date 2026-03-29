@@ -62,23 +62,12 @@ export function useFileTransfer() {
   const [error, setError] = useState<string | null>(null);
   const [saveReady, setSaveReady] = useState(false);
 
-<<<<<<< HEAD
-  const dcRef = useRef<RTCDataChannel | null>(null);
-  const writableRef = useRef<FileSystemWritableFileStream | null>(null);
-  const chunksRef = useRef<{ offset: number; data: Uint8Array }[]>([]);
-=======
   // Receiver state — writable stream for disk-streaming, chunks for fallback
   const writableRef = useRef<FileSystemWritableFileStream | null>(null);
   const chunksRef = useRef<Uint8Array[]>([]);
->>>>>>> parent of bdd681c (ram_check)
   const receivedBytesRef = useRef(0);
   const expectedBytesRef = useRef(0);
   const useStreamRef = useRef(false);
-<<<<<<< HEAD
-  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
-  const fileCompleteRef = useRef(false);
-  const boostPcsRef = useRef<Map<number, RTCPeerConnection>>(new Map());
-=======
 
   // Speed tracking
 >>>>>>> parent of bdd681c (ram_check)
@@ -164,69 +153,11 @@ export function useFileTransfer() {
     startTimeRef.current = performance.now();
     lastSpeedUpdateRef.current = performance.now();
     lastBytesRef.current = 0;
-<<<<<<< HEAD
-=======
 
     dc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
->>>>>>> parent of bdd681c (ram_check)
 
-    // Active channel pool — starts with primary DC
-    const channels: RTCDataChannel[] = [dc];
-    let nextBoostIdx = 0;
-    let scalingDone = false;
-    const boostPcs: RTCPeerConnection[] = [];
+    let fileOffset = 0;
 
-<<<<<<< HEAD
-    // ── Create one boost connection via primary DC signaling ──
-    const createBoost = (idx: number): Promise<RTCDataChannel | null> => {
-      return new Promise((resolve) => {
-        const pc = new RTCPeerConnection(RTC_CONFIG);
-        boostPcs.push(pc);
-        const bdc = pc.createDataChannel(`b${idx}`, { ordered: false });
-        bdc.binaryType = "arraybuffer";
-        bdc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate) dc.send(JSON.stringify({
-            type: "boost-ice", channelIndex: idx, candidate: e.candidate.toJSON(),
-          }));
-        };
-
-        const listener = (ev: MessageEvent) => {
-          if (typeof ev.data !== "string") return;
-          try {
-            const m = JSON.parse(ev.data);
-            if (m.type === "boost-answer" && m.channelIndex === idx)
-              pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: m.sdp }));
-            if (m.type === "boost-ice" && m.channelIndex === idx)
-              pc.addIceCandidate(new RTCIceCandidate(m.candidate)).catch(() => {});
-          } catch { /* */ }
-        };
-        dc.addEventListener("message", listener);
-
-        const cleanup = () => dc.removeEventListener("message", listener);
-        const timer = setTimeout(() => { cleanup(); resolve(null); }, BOOST_TIMEOUT);
-
-        bdc.onopen = () => { clearTimeout(timer); cleanup(); resolve(bdc); };
-        bdc.onerror = () => { clearTimeout(timer); cleanup(); resolve(null); };
-
-        pc.createOffer().then(o => {
-          pc.setLocalDescription(o);
-          dc.send(JSON.stringify({ type: "boost-offer", channelIndex: idx, sdp: o.sdp }));
-        });
-      });
-    };
-
-    // ── Add a batch of boost connections ──
-    const addBatch = async (count: number) => {
-      const promises: Promise<RTCDataChannel | null>[] = [];
-      for (let i = 0; i < count && channels.length + promises.length < MAX_CHANNELS; i++) {
-        promises.push(createBoost(nextBoostIdx++));
-      }
-      const results = await Promise.allSettled(promises);
-      for (const r of results) {
-        if (r.status === "fulfilled" && r.value) channels.push(r.value);
-=======
     const waitForDrain = (): Promise<void> => {
       return new Promise((resolve) => {
         if (dc.bufferedAmount <= BUFFERED_AMOUNT_LOW_THRESHOLD) {
@@ -257,7 +188,6 @@ export function useFileTransfer() {
           speed,
           completed: false,
         });
->>>>>>> parent of bdd681c (ram_check)
       }
     };
 
@@ -276,22 +206,6 @@ export function useFileTransfer() {
     // ── Main send loop ──
     const sendLoop = async () => {
       try {
-<<<<<<< HEAD
-        await waitMsg(dc, "ready-to-receive");
-
-        // Start initial boost batch (don't await — send data while connecting)
-        const boostPromise = addBatch(BOOST_BATCH);
-
-        let fileOffset = 0;
-        let lastScaleCheck = performance.now();
-        let lastChannelLog = 0;
-
-        // Wait for first boost channels to connect
-        await Promise.race([boostPromise, new Promise(r => setTimeout(r, 4000))]);
-        console.log(`[P2P] Starting transfer with ${channels.length} channels`);
-
-=======
->>>>>>> parent of bdd681c (ram_check)
         while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
 
@@ -322,36 +236,6 @@ export function useFileTransfer() {
           const blockBuf = await file.slice(blockStart, blockEnd).arrayBuffer();
           const blockLen = blockBuf.byteLength;
 
-<<<<<<< HEAD
-          let bOff = 0;
-          while (bOff < blockLen) {
-            if (abortRef.current) return;
-
-            // Pick the channel with the LOWEST bufferedAmount (least-loaded)
-            let best: RTCDataChannel | null = null;
-            let bestBuf = Infinity;
-            for (const ch of channels) {
-              if (ch.readyState === "open" && ch.bufferedAmount < bestBuf) {
-                best = ch; bestBuf = ch.bufferedAmount;
-              }
-            }
-
-            if (!best) { await new Promise(r => setTimeout(r, 50)); continue; }
-
-            // If even the least-loaded channel is full, wait for ANY to drain
-            if (bestBuf >= HIGH_WATER_MARK) {
-              await Promise.race(
-                channels.filter(c => c.readyState === "open").map(waitDrain)
-              );
-              continue; // re-pick after drain
-            }
-
-            const end = Math.min(bOff + DATA_PER_CHUNK, blockLen);
-            const packed = packChunk(blockStart + bOff, blockBuf.slice(bOff, end));
-            best.send(packed);
-            bOff = end;
-            updateStats(blockStart + bOff);
-=======
           let blockOffset = 0;
           while (blockOffset < blockLen) {
             if (abortRef.current || dc.readyState !== "open") return;
@@ -366,26 +250,16 @@ export function useFileTransfer() {
 
             blockOffset = chunkEnd;
             updateSendStats(blockStart + blockOffset);
->>>>>>> parent of bdd681c (ram_check)
           }
 
           fileOffset = blockEnd;
         }
 
-<<<<<<< HEAD
-        // Drain all channel buffers
-        await Promise.all(channels.filter(c => c.readyState === "open").map(waitDrain));
-        if (dc.readyState === "open") dc.send(JSON.stringify({ type: "file-complete" }));
-=======
         await waitForDrain();
 
         if (dc.readyState === "open") {
           dc.send(JSON.stringify({ type: "file-complete" }));
         }
->>>>>>> parent of bdd681c (ram_check)
-
-        // Cleanup boost PCs
-        boostPcs.forEach(pc => pc.close());
 
         const totalTime = (performance.now() - startTimeRef.current) / 1000;
         setStats({
@@ -405,71 +279,6 @@ export function useFileTransfer() {
     sendLoop();
   }, []);
 
-<<<<<<< HEAD
-  // ════════════════════ RECEIVER ════════════════════
-
-  /** Shared handler for binary chunks from any data channel */
-  const handleBinaryChunk = useCallback((data: ArrayBuffer) => {
-    const { offset, data: chunkData } = unpackChunk(data);
-    receivedBytesRef.current += chunkData.byteLength;
-
-    if (useStreamRef.current && writableRef.current) {
-      const w = writableRef.current;
-      writeChainRef.current = writeChainRef.current.then(() =>
-        w.write({ type: "write" as const, position: offset, data: chunkData })
-      );
-    } else {
-      chunksRef.current.push({ offset, data: new Uint8Array(chunkData) });
-    }
-
-    const now = performance.now();
-    if (now - lastSpeedUpdateRef.current >= SPEED_UPDATE_INTERVAL) {
-      const elapsed = (now - lastSpeedUpdateRef.current) / 1000;
-      const speed = elapsed > 0 ? (receivedBytesRef.current - lastBytesRef.current) / elapsed : 0;
-      lastSpeedUpdateRef.current = now;
-      lastBytesRef.current = receivedBytesRef.current;
-      const exp = expectedBytesRef.current || 1;
-      setStats(p => ({ ...p,
-        progress: Math.round((receivedBytesRef.current / exp) * 100),
-        bytesTransferred: receivedBytesRef.current, speed }));
-    }
-
-    // Check if transfer is complete (for unordered channels, file-complete may arrive before last chunk)
-    if (fileCompleteRef.current && receivedBytesRef.current >= expectedBytesRef.current) {
-      finalizeReceive();
-    }
-  }, []);
-
-  const finalizeReceive = useCallback(() => {
-    const totalTime = (performance.now() - startTimeRef.current) / 1000;
-    const finalBytes = receivedBytesRef.current;
-    const exp = expectedBytesRef.current;
-
-    writeChainRef.current.then(async () => {
-      if (useStreamRef.current && writableRef.current) {
-        try { await writableRef.current.close(); } catch { /* */ }
-        writableRef.current = null;
-        setDownloadUrl("saved-to-disk");
-      } else {
-        chunksRef.current.sort((a, b) => a.offset - b.offset);
-        const blob = new Blob(chunksRef.current.map(c => c.data) as unknown as BlobPart[], { type: "application/zip" });
-        setDownloadUrl(URL.createObjectURL(blob));
-        chunksRef.current = [];
-      }
-      boostPcsRef.current.forEach(pc => pc.close()); boostPcsRef.current = new Map();
-      setStats({ progress: 100, bytesTransferred: finalBytes, totalBytes: exp,
-        speed: totalTime > 0 ? finalBytes / totalTime : 0, completed: true });
-    });
-  }, []);
-
-  const promptSaveLocation = useCallback(async (meta: FileMeta): Promise<boolean> => {
-    let streaming = false;
-    if ("showSaveFilePicker" in window) {
-      try {
-        const handle = await (window as unknown as {
-          showSaveFilePicker: (o: unknown) => Promise<FileSystemFileHandle>;
-        }).showSaveFilePicker({
-=======
   // ── RECEIVER ──
 
   /**
@@ -489,7 +298,6 @@ export function useFileTransfer() {
     try {
       const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> })
         .showSaveFilePicker({
->>>>>>> parent of bdd681c (ram_check)
           suggestedName: meta.fileName,
           types: [
             {
@@ -498,19 +306,6 @@ export function useFileTransfer() {
             },
           ],
         });
-<<<<<<< HEAD
-        const writable = await handle.createWritable();
-        await writable.truncate(meta.fileSize); // pre-allocate file
-        writableRef.current = writable;
-        useStreamRef.current = true;
-        streaming = true;
-      } catch { useStreamRef.current = false; }
-    }
-    setSaveReady(true);
-    if (dcRef.current?.readyState === "open")
-      dcRef.current.send(JSON.stringify({ type: "ready-to-receive" }));
-    return streaming;
-=======
 
       const writable = await handle.createWritable();
       writableRef.current = writable;
@@ -524,76 +319,11 @@ export function useFileTransfer() {
       setSaveReady(true);
       return false;
     }
->>>>>>> parent of bdd681c (ram_check)
   }, []);
 
   const setupReceiver = useCallback((dc: RTCDataChannel) => {
     dc.binaryType = "arraybuffer";
 
-<<<<<<< HEAD
-    dc.onmessage = (e) => {
-      // Binary chunk (from primary DC)
-      if (typeof e.data !== "string") { handleBinaryChunk(e.data as ArrayBuffer); return; }
-
-      try {
-        const msg = JSON.parse(e.data);
-
-        if (msg.type === "file-meta") {
-          const meta = msg as FileMeta;
-          setIncomingMeta(meta);
-          expectedBytesRef.current = meta.fileSize;
-          fileCompleteRef.current = false;
-          chunksRef.current = []; receivedBytesRef.current = 0;
-          writeChainRef.current = Promise.resolve();
-          startTimeRef.current = performance.now();
-          lastSpeedUpdateRef.current = performance.now();
-          lastBytesRef.current = 0;
-          setStats({ progress: 0, bytesTransferred: 0, totalBytes: meta.fileSize,
-            speed: 0, completed: false });
-          setDownloadUrl(null); setSaveReady(false); setError(null);
-          return;
-        }
-
-        if (msg.type === "file-complete") {
-          fileCompleteRef.current = true;
-          if (receivedBytesRef.current >= expectedBytesRef.current) finalizeReceive();
-          return;
-        }
-
-        // ── Boost connection handling ──
-        if (msg.type === "boost-offer") {
-          const idx = msg.channelIndex as number;
-          const pc = new RTCPeerConnection(RTC_CONFIG);
-          boostPcsRef.current.set(idx, pc);
-
-          pc.ondatachannel = (ev: RTCDataChannelEvent) => {
-            const bdc = ev.channel;
-            bdc.binaryType = "arraybuffer";
-            bdc.onmessage = (be) => {
-              if (typeof be.data !== "string") handleBinaryChunk(be.data as ArrayBuffer);
-            };
-          };
-
-          pc.onicecandidate = (ev) => {
-            if (ev.candidate) dc.send(JSON.stringify({
-              type: "boost-ice", channelIndex: idx, candidate: ev.candidate.toJSON(),
-            }));
-          };
-
-          pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: msg.sdp }))
-            .then(() => pc.createAnswer())
-            .then(ans => {
-              pc.setLocalDescription(ans);
-              dc.send(JSON.stringify({ type: "boost-answer", channelIndex: idx, sdp: ans.sdp }));
-            });
-          return;
-        }
-
-        if (msg.type === "boost-ice") {
-          const pc = boostPcsRef.current.get(msg.channelIndex as number);
-          if (pc) pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {});
-          return;
-=======
     let expectedBytes = 0;
 
     dc.onmessage = async (e) => {
@@ -701,7 +431,6 @@ export function useFileTransfer() {
             bytesTransferred: receivedBytesRef.current,
             speed,
           }));
->>>>>>> parent of bdd681c (ram_check)
         }
       } catch { /* ignore */ }
     };
