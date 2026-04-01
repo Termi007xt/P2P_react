@@ -164,7 +164,10 @@ export function SenderPanel({
         <div className="bg-emerald-900/20 border border-emerald-800/50 rounded-2xl p-4 text-center space-y-3">
           <div className="text-emerald-400 text-sm font-medium">✓ Transfer complete</div>
           <button
-            onClick={onSendAnother}
+            onClick={() => {
+              if (fileInputRef.current) fileInputRef.current.value = "";
+              onSendAnother();
+            }}
             className="w-full py-2.5 bg-white text-black font-semibold rounded-xl hover:bg-neutral-200 transition-colors text-sm"
           >
             Send Another File

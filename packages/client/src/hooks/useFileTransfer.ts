@@ -213,6 +213,15 @@ export function useFileTransfer() {
             }
             useStreamRef.current = false;
 
+            // ── Reject files exceeding the size limit ──
+            if (meta.fileSize > MAX_FILE_SIZE) {
+              setError(`File is too large. Maximum allowed size is ${(MAX_FILE_SIZE / (1024 * 1024)).toFixed(0)} MB.`);
+              if (dc.readyState === "open") {
+                dc.send(JSON.stringify({ type: "abort-transfer", reason: "file-too-large" }));
+              }
+              return;
+            }
+
             setIncomingMeta(meta);
             expectedBytes = meta.fileSize;
             chunksRef.current = [];
