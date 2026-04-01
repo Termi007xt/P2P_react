@@ -6,6 +6,7 @@ import {
   HIGH_WATER_MARK,
   BUFFERED_AMOUNT_LOW_THRESHOLD,
   SPEED_UPDATE_INTERVAL,
+  MAX_FILE_SIZE,
 } from "../lib/constants";
 
 const INITIAL_STATS: TransferStats = {
@@ -56,12 +57,12 @@ export function useFileTransfer() {
   // ────────────────── SENDER ──────────────────
 
   const sendFile = useCallback((file: File, dc: RTCDataChannel) => {
-    if (!file.name.endsWith(".zip")) { setError("Only .zip files are allowed."); return; }
+    if (file.size > MAX_FILE_SIZE) { setError(`File exceeds the maximum size limit.`); return; }
 
     const totalBytes = file.size;
     const meta: FileMeta = {
       type: "file-meta", fileName: file.name, fileSize: totalBytes,
-      mimeType: "application/zip", chunkSize: CHUNK_SIZE,
+      mimeType: file.type || "application/octet-stream", chunkSize: CHUNK_SIZE,
       totalChunks: Math.ceil(totalBytes / CHUNK_SIZE),
     };
     dc.send(JSON.stringify(meta));
@@ -155,14 +156,21 @@ export function useFileTransfer() {
   const promptSaveLocation = useCallback(async (meta: FileMeta): Promise<boolean> => {
     let streaming = false;
 
+    // Extract extension from the incoming file name (e.g. ".png", ".mp4", ".zip")
+    const dotIndex = meta.fileName.lastIndexOf(".");
+    const ext = dotIndex !== -1 ? meta.fileName.slice(dotIndex) : "";
+    const mimeType = meta.mimeType || "application/octet-stream";
+
     if ("showSaveFilePicker" in window) {
       try {
+        const pickerOpts: Record<string, unknown> = { suggestedName: meta.fileName };
+        // Only set types filter if we have a valid extension
+        if (ext) {
+          pickerOpts.types = [{ description: meta.fileName, accept: { [mimeType]: [ext] } }];
+        }
         const handle = await (window as unknown as {
           showSaveFilePicker: (o: unknown) => Promise<FileSystemFileHandle>;
-        }).showSaveFilePicker({
-          suggestedName: meta.fileName,
-          types: [{ description: "ZIP Archive", accept: { "application/zip": [".zip"] } }],
-        });
+        }).showSaveFilePicker(pickerOpts);
         const writable = await handle.createWritable();
         writableRef.current = writable;
         useStreamRef.current = true;
@@ -197,6 +205,14 @@ export function useFileTransfer() {
 
           if (msg.type === "file-meta") {
             const meta = msg as FileMeta;
+
+            // ── Clean up previous transfer's stream (if any) ──
+            if (writableRef.current) {
+              try { writableRef.current.close(); } catch { /* already closed */ }
+              writableRef.current = null;
+            }
+            useStreamRef.current = false;
+
             setIncomingMeta(meta);
             expectedBytes = meta.fileSize;
             chunksRef.current = [];
@@ -205,6 +221,8 @@ export function useFileTransfer() {
             startTimeRef.current = performance.now();
             lastSpeedUpdateRef.current = performance.now();
             lastBytesRef.current = 0;
+            // Store meta on the data channel so the blob fallback can use the correct MIME type
+            (dc as unknown as { __incomingMeta?: FileMeta }).__incomingMeta = meta;
             setStats({ progress: 0, bytesTransferred: 0, totalBytes: meta.fileSize,
               speed: 0, completed: false });
             setDownloadUrl(null);
@@ -226,8 +244,10 @@ export function useFileTransfer() {
                 writableRef.current = null;
                 setDownloadUrl("saved-to-disk");
               } else {
+                const inMeta = (dc as unknown as { __incomingMeta?: FileMeta }).__incomingMeta;
+                const blobType = inMeta?.mimeType || "application/octet-stream";
                 const blob = new Blob(chunksRef.current as unknown as BlobPart[],
-                  { type: "application/zip" });
+                  { type: blobType });
                 setDownloadUrl(URL.createObjectURL(blob));
                 chunksRef.current = [];
               }

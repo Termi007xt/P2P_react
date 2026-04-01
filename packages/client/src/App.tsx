@@ -196,6 +196,11 @@ export default function App() {
     transfer.sendFile(selectedFile, activeDcRef.current);
   }, [selectedFile, transfer]);
 
+  const handleSendAnother = useCallback(() => {
+    transfer.resetStats();
+    setSelectedFile(null);
+  }, [transfer]);
+
   // ── Auto-join from URL params ──
 
   useEffect(() => {
@@ -281,6 +286,7 @@ export default function App() {
             error={combinedError}
             onSelectFile={setSelectedFile}
             onStartTransfer={handleStartTransfer}
+            onSendAnother={handleSendAnother}
           />
         )}
 
