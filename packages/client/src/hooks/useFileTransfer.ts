@@ -78,13 +78,19 @@ export function useFileTransfer() {
     let fileOffset = 0;
 
     // ── Wait for receiver to signal ready ──
-    const waitForReady = new Promise<void>((resolve) => {
+    const waitForReady = new Promise<void>((resolve, reject) => {
       const listener = (ev: MessageEvent) => {
         if (typeof ev.data === "string") {
           try {
-            if (JSON.parse(ev.data).type === "ready-to-receive") {
+            const parsed = JSON.parse(ev.data);
+            if (parsed.type === "ready-to-receive") {
               dc.removeEventListener("message", listener);
               resolve();
+            } else if (parsed.type === "abort-transfer") {
+              dc.removeEventListener("message", listener);
+              reject(new Error(parsed.reason === "file-too-large"
+                ? "Receiver rejected the file: exceeds size limit."
+                : `Transfer aborted by receiver: ${parsed.reason || "unknown reason"}`));
             }
           } catch { /* ignore */ }
         }
@@ -113,6 +119,23 @@ export function useFileTransfer() {
     const sendLoop = async () => {
       try {
         await waitForReady; // ← sender blocks until receiver picks save location
+
+        // Listen for mid-transfer abort (e.g. receiver's chunk-size cap)
+        const abortListener = (ev: MessageEvent) => {
+          if (typeof ev.data === "string") {
+            try {
+              const parsed = JSON.parse(ev.data);
+              if (parsed.type === "abort-transfer") {
+                abortRef.current = true;
+                setError(parsed.reason === "file-too-large"
+                  ? "Receiver rejected the file: exceeds size limit."
+                  : `Transfer aborted by receiver: ${parsed.reason || "unknown reason"}`);
+                dc.removeEventListener("message", abortListener);
+              }
+            } catch { /* ignore */ }
+          }
+        };
+        dc.addEventListener("message", abortListener);
 
         while (fileOffset < totalBytes) {
           if (abortRef.current || dc.readyState !== "open") return;
@@ -272,6 +295,22 @@ export function useFileTransfer() {
         // Binary chunk — write to disk (queued) or memory
         const data = e.data as ArrayBuffer;
         receivedBytesRef.current += data.byteLength;
+
+        // Enforce the size cap against malicious/buggy senders
+        if (receivedBytesRef.current > MAX_FILE_SIZE) {
+          setError(`Transfer exceeded the ${(MAX_FILE_SIZE / (1024 * 1024)).toFixed(0)} MB limit. Transfer aborted.`);
+          if (dc.readyState === "open") {
+            dc.send(JSON.stringify({ type: "abort-transfer", reason: "file-too-large" }));
+          }
+          // Cleanup: close stream, clear memory, remove handler
+          if (writableRef.current) {
+            try { writableRef.current.abort(); } catch { /* ignore */ }
+            writableRef.current = null;
+          }
+          chunksRef.current = [];
+          dc.onmessage = null;
+          return;
+        }
 
         if (useStreamRef.current && writableRef.current) {
           // Chain writes sequentially so they don't pile up as parallel promises
