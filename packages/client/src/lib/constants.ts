@@ -3,6 +3,7 @@ export const DISK_READ_SIZE = 16 * 1024 * 1024; // 16 MB — read large blocks f
 export const HIGH_WATER_MARK = 8 * 1024 * 1024; // 8 MB — stop sending when buffer exceeds this
 export const BUFFERED_AMOUNT_LOW_THRESHOLD = 2 * 1024 * 1024; // 2 MB — resume sending when buffer drains to this
 export const SPEED_UPDATE_INTERVAL = 300; // ms
+export const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB — max file size for transfer
 
 export const RTC_CONFIG: RTCConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],

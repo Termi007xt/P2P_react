@@ -2,7 +2,7 @@ import React, { useRef } from "react";
 import type { RtcState, TransferStats } from "../types";
 import { StatusBadge } from "./StatusBadge";
 import { TransferProgress } from "./TransferProgress";
-import { formatBytes } from "../lib/constants";
+import { formatBytes, MAX_FILE_SIZE } from "../lib/constants";
 
 interface SenderPanelProps {
   roomCode: string;
@@ -14,6 +14,7 @@ interface SenderPanelProps {
   error: string | null;
   onSelectFile: (file: File) => void;
   onStartTransfer: () => void;
+  onSendAnother: () => void;
 }
 
 export function SenderPanel({
@@ -26,6 +27,7 @@ export function SenderPanel({
   error,
   onSelectFile,
   onStartTransfer,
+  onSendAnother,
 }: SenderPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const copied = useRef(false);
@@ -46,8 +48,8 @@ export function SenderPanel({
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.name.endsWith(".zip")) {
-      alert("Only .zip files are allowed.");
+    if (file.size > MAX_FILE_SIZE) {
+      alert(`File exceeds the ${formatBytes(MAX_FILE_SIZE)} limit.`);
       e.target.value = "";
       return;
     }
@@ -105,7 +107,6 @@ export function SenderPanel({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".zip"
             onChange={handleFileChange}
             className="hidden"
             id="file-input"
@@ -116,7 +117,7 @@ export function SenderPanel({
               onClick={() => fileInputRef.current?.click()}
               className="w-full py-4 border-2 border-dashed border-neutral-700 rounded-2xl text-neutral-400 hover:border-neutral-500 hover:text-neutral-300 transition-colors text-sm"
             >
-              Click to select a .zip file
+              Click to select a file (max {formatBytes(MAX_FILE_SIZE)})
             </button>
           ) : (
             <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-4 flex items-center justify-between">
@@ -160,8 +161,17 @@ export function SenderPanel({
 
       {/* Completion */}
       {stats.completed && (
-        <div className="bg-emerald-900/20 border border-emerald-800/50 rounded-2xl p-4 text-center">
+        <div className="bg-emerald-900/20 border border-emerald-800/50 rounded-2xl p-4 text-center space-y-3">
           <div className="text-emerald-400 text-sm font-medium">✓ Transfer complete</div>
+          <button
+            onClick={() => {
+              if (fileInputRef.current) fileInputRef.current.value = "";
+              onSendAnother();
+            }}
+            className="w-full py-2.5 bg-white text-black font-semibold rounded-xl hover:bg-neutral-200 transition-colors text-sm"
+          >
+            Send Another File
+          </button>
         </div>
       )}
 
