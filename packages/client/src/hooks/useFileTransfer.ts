@@ -7,6 +7,7 @@ import {
   BUFFERED_AMOUNT_LOW_THRESHOLD,
   SPEED_UPDATE_INTERVAL,
   MAX_FILE_SIZE,
+  formatBytes,
 } from "../lib/constants";
 
 const INITIAL_STATS: TransferStats = {
@@ -238,7 +239,7 @@ export function useFileTransfer() {
 
             // ── Reject files exceeding the size limit ──
             if (meta.fileSize > MAX_FILE_SIZE) {
-              setError(`File is too large. Maximum allowed size is ${(MAX_FILE_SIZE / (1024 * 1024)).toFixed(0)} MB.`);
+              setError(`File is too large. Maximum allowed size is ${formatBytes(MAX_FILE_SIZE)}.`);
               if (dc.readyState === "open") {
                 dc.send(JSON.stringify({ type: "abort-transfer", reason: "file-too-large" }));
               }
@@ -298,7 +299,7 @@ export function useFileTransfer() {
 
         // Enforce the size cap against malicious/buggy senders
         if (receivedBytesRef.current > MAX_FILE_SIZE) {
-          setError(`Transfer exceeded the ${(MAX_FILE_SIZE / (1024 * 1024)).toFixed(0)} MB limit. Transfer aborted.`);
+          setError(`Transfer exceeded the ${formatBytes(MAX_FILE_SIZE)} limit. Transfer aborted.`);
           if (dc.readyState === "open") {
             dc.send(JSON.stringify({ type: "abort-transfer", reason: "file-too-large" }));
           }
